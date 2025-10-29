@@ -1,13 +1,57 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
+import { supabase } from '../supabaseClient';
+import { useAuth } from '../contexts/AuthContext';
 
 function AccountSettings() {
   const [accountInfo, setAccountInfo] = useState({
-    clientId: 'your-client-id',
-    apiKey: 'your-api-key',
+    client_id: '',
+    api_key: '',
   });
 
   const [isEditing, setIsEditing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const { user } = useAuth(); // 获取当前用户信息
+
+  // 获取账户信息
+  useEffect(() => {
+    if (user) {
+      fetchAccountInfo();
+    }
+  }, [user]);
+
+  const fetchAccountInfo = async () => {
+    try {
+      setLoading(true);
+      const { data, error } = await supabase
+        .from('account_settings')
+        .select('client_id, api_key')
+        .eq('user_id', user.id)
+        .single();
+
+      if (error && error.code !== 'PGRST116') { // PGRST116 表示没有找到记录
+        throw error;
+      }
+
+      if (data) {
+        setAccountInfo({
+          client_id: data.client_id || '',
+          api_key: data.api_key || '',
+        });
+      } else {
+        // 如果没有记录，初始化为空值
+        setAccountInfo({
+          client_id: '',
+          api_key: '',
+        });
+      }
+    } catch (error) {
+      console.error('获取账户信息失败:', error);
+      alert('获取账户信息失败，请确保您已正确登录');
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const handleChange = (e) => {
     const { name, value } = e.target;
@@ -16,11 +60,29 @@ function AccountSettings() {
 
   const handleSave = async (e) => {
     e.preventDefault();
+    if (!user) {
+      alert('请先登录再执行此操作');
+      return;
+    }
+
     setSaving(true);
     try {
-      // TODO: 调用保存 API
-      console.log('保存账户信息:', accountInfo);
+      const { data, error } = await supabase
+        .from('account_settings')
+        .upsert({
+          user_id: user.id,
+          client_id: accountInfo.client_id,
+          api_key: accountInfo.api_key,
+        }, {
+          onConflict: 'user_id'
+        });
+
+      if (error) throw error;
+
       setIsEditing(false);
+    } catch (error) {
+      console.error('保存账户信息失败:', error);
+      alert(`保存账户信息失败: ${error.message}`);
     } finally {
       setSaving(false);
     }
@@ -28,7 +90,30 @@ function AccountSettings() {
 
   const handleCancel = () => {
     setIsEditing(false);
+    // 重新获取数据以恢复原始值
+    fetchAccountInfo();
   };
+
+  // 如果用户未登录，显示提示信息
+  if (!user) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="text-center">
+          <h2 className="text-2xl font-bold mb-4">请先登录</h2>
+          <p className="text-muted-foreground">您需要登录后才能查看和管理账户设置</p>
+        </div>
+      </div>
+    );
+  }
+
+  // 加载状态显示
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500"></div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -47,13 +132,13 @@ function AccountSettings() {
                 {isEditing ? (
                   <input
                     type="text"
-                    name="clientId"
-                    value={accountInfo.clientId}
+                    name="client_id"
+                    value={accountInfo.client_id}
                     onChange={handleChange}
                     className="input"
                   />
                 ) : (
-                  <div className="input font-mono">{accountInfo.clientId}</div>
+                  <div className="input font-mono">{accountInfo.client_id || '未设置'}</div>
                 )}
                 <p className="text-sm text-muted-foreground">你的 Ozon 账户 Client ID。</p>
               </div>
@@ -64,14 +149,14 @@ function AccountSettings() {
                 {isEditing ? (
                   <input
                     type="password"
-                    name="apiKey"
-                    value={accountInfo.apiKey}
+                    name="api_key"
+                    value={accountInfo.api_key}
                     onChange={handleChange}
                     className="input"
                   />
                 ) : (
                   <div className="input font-mono">
-                    {'•'.repeat(Math.max(8, accountInfo.apiKey.length))}
+                    {accountInfo.api_key ? '•'.repeat(Math.max(8, accountInfo.api_key.length)) : '未设置'}
                   </div>
                 )}
                 <p className="text-sm text-muted-foreground">API Key 具备高权限，仅在受信环境使用并避免泄露。</p>

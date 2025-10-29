@@ -1,24 +1,40 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
+import { supabase } from '../supabaseClient';
+import { useAuth } from '../contexts/AuthContext';
 
 function ShippingPointSettings() {
-  const [shippingPoints, setShippingPoints] = useState([
-    {
-      id: 1,
-      name: 'Moscow Warehouse',
-      pointId: 'WH-MSK-001',
-      supportTypes: ['box', 'pallet'],
-    },
-    {
-      id: 2,
-      name: 'SPB Warehouse',
-      pointId: 'WH-SPB-001',
-      supportTypes: ['box'],
-    },
-  ]);
-
+  const [shippingPoints, setShippingPoints] = useState([]);
+  const [loading, setLoading] = useState(true);
   const [isEditing, setIsEditing] = useState(null);
   const [editForm, setEditForm] = useState({});
   const [isNewPoint, setIsNewPoint] = useState(false); // 标记是否为新增提货点
+  const { user } = useAuth(); // 获取当前用户信息
+
+  // 获取发货点数据
+  useEffect(() => {
+    if (user) {
+      fetchShippingPoints();
+    }
+  }, [user]);
+
+  const fetchShippingPoints = async () => {
+    try {
+      setLoading(true);
+      const { data, error } = await supabase
+        .from('shipping_points')
+        .select('*')
+        .order('id');
+
+      if (error) throw error;
+      setShippingPoints(data || []);
+    } catch (error) {
+      console.error('获取发货点数据失败:', error);
+      // 显示用户友好的错误消息
+      alert('获取发货点数据失败，请确保您已正确登录');
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const handleEdit = (point) => {
     setIsEditing(point.id);
@@ -26,24 +42,49 @@ function ShippingPointSettings() {
     setIsNewPoint(false); // 编辑现有提货点
   };
 
-  const handleSave = () => {
-    if (isNewPoint) {
-      // 保存新增提货点
-      setShippingPoints([...shippingPoints, editForm]);
-    } else {
-      // 保存编辑的提货点
-      setShippingPoints(
-        shippingPoints.map((p) => (p.id === isEditing ? editForm : p))
-      );
+  const handleSave = async () => {
+    if (!user) {
+      alert('请先登录再执行此操作');
+      return;
     }
-    setIsEditing(null);
-    setEditForm({});
-    setIsNewPoint(false);
+
+    try {
+      if (isNewPoint) {
+        // 新增发货点
+        const { data, error } = await supabase
+          .from('shipping_points')
+          .insert([editForm])
+          .select();
+
+        if (error) throw error;
+        // 重新获取数据以确保ID正确
+        await fetchShippingPoints();
+      } else {
+        // 更新发货点
+        const { data, error } = await supabase
+          .from('shipping_points')
+          .update(editForm)
+          .eq('id', isEditing)
+          .select();
+
+        if (error) throw error;
+        setShippingPoints(
+          shippingPoints.map((p) => (p.id === isEditing ? data[0] : p))
+        );
+      }
+      setIsEditing(null);
+      setEditForm({});
+      setIsNewPoint(false);
+    } catch (error) {
+      console.error('保存发货点失败:', error);
+      alert(`保存发货点失败: ${error.message}`);
+    }
   };
 
   const handleCancel = () => {
-    // 如果是新增提货点且点击取消，则从列表中移除
+    // 如果是新增发货点且点击取消，则从列表中移除
     if (isNewPoint) {
+      // 移除临时添加的发货点项
       setShippingPoints(shippingPoints.filter((p) => p.id !== isEditing));
     }
     setIsEditing(null);
@@ -53,35 +94,58 @@ function ShippingPointSettings() {
 
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
   const handleDelete = (id) => setConfirmDeleteId(id);
-  const doDelete = () => {
-    setShippingPoints(shippingPoints.filter((p) => p.id !== confirmDeleteId));
-    setConfirmDeleteId(null);
+  
+  const doDelete = async () => {
+    if (!user) {
+      alert('请先登录再执行此操作');
+      return;
+    }
+
+    try {
+      const { error } = await supabase
+        .from('shipping_points')
+        .delete()
+        .eq('id', confirmDeleteId);
+
+      if (error) throw error;
+      setShippingPoints(shippingPoints.filter((p) => p.id !== confirmDeleteId));
+      setConfirmDeleteId(null);
+    } catch (error) {
+      console.error('删除发货点失败:', error);
+      alert(`删除发货点失败: ${error.message}`);
+    }
   };
 
   const handleAdd = () => {
+    if (!user) {
+      alert('请先登录再执行此操作');
+      return;
+    }
+
     const newPoint = {
-      id: Date.now(),
       name: '',
-      pointId: '',
-      supportTypes: ['box'],
+      point_id: '', // 使用下划线命名以匹配数据库字段
+      support_types: ['box'], // 使用下划线命名以匹配数据库字段
     };
-    setShippingPoints([...shippingPoints, newPoint]);
-    setIsEditing(newPoint.id);
+    // 添加一个新的临时ID用于识别新增行
+    const tempId = 'new_' + Date.now();
+    setShippingPoints([...shippingPoints, { ...newPoint, id: tempId }]);
+    setIsEditing(tempId);
     setEditForm(newPoint);
     setIsNewPoint(true); // 标记为新增提货点
   };
 
   const handleTypeToggle = (type) => {
-    const currentTypes = editForm.supportTypes || [];
+    const currentTypes = editForm.support_types || [];
     if (currentTypes.includes(type)) {
       setEditForm({
         ...editForm,
-        supportTypes: currentTypes.filter((t) => t !== type),
+        support_types: currentTypes.filter((t) => t !== type),
       });
     } else {
       setEditForm({
         ...editForm,
-        supportTypes: [...currentTypes, type],
+        support_types: [...currentTypes, type],
       });
     }
   };
@@ -93,6 +157,27 @@ function ShippingPointSettings() {
     };
     return types.map((t) => typeMap[t]).join('、');
   };
+
+  // 如果用户未登录，显示提示信息
+  if (!user) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="text-center">
+          <h2 className="text-2xl font-bold mb-4">请先登录</h2>
+          <p className="text-muted-foreground">您需要登录后才能查看和管理发货点</p>
+        </div>
+      </div>
+    );
+  }
+
+  // 加载状态显示
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500"></div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -141,9 +226,9 @@ function ShippingPointSettings() {
                       <td className="table-cell">
                         <input
                           type="text"
-                          value={editForm.pointId}
+                          value={editForm.point_id}
                           onChange={(e) =>
-                            setEditForm({ ...editForm, pointId: e.target.value })
+                            setEditForm({ ...editForm, point_id: e.target.value })
                           }
                           className="input"
                           placeholder="WH-XXX-001"
@@ -154,7 +239,7 @@ function ShippingPointSettings() {
                           <label className="flex items-center">
                             <input
                               type="checkbox"
-                              checked={editForm.supportTypes?.includes('box')}
+                              checked={editForm.support_types?.includes('box')}
                               onChange={() => handleTypeToggle('box')}
                               className="h-4 w-4 rounded border-input"
                             />
@@ -163,7 +248,7 @@ function ShippingPointSettings() {
                           <label className="flex items-center">
                             <input
                               type="checkbox"
-                              checked={editForm.supportTypes?.includes('pallet')}
+                              checked={editForm.support_types?.includes('pallet')}
                               onChange={() => handleTypeToggle('pallet')}
                               className="h-4 w-4 rounded border-input"
                             />
@@ -191,10 +276,10 @@ function ShippingPointSettings() {
                   ) : (
                     <>
                       <td className="table-cell font-medium">{point.name}</td>
-                      <td className="table-cell">{point.pointId}</td>
+                      <td className="table-cell">{point.point_id}</td>
                       <td className="table-cell">
                         <span className="badge badge-secondary">
-                          {getSupportTypesText(point.supportTypes)}
+                          {getSupportTypesText(point.support_types)}
                         </span>
                       </td>
                       <td className="table-cell text-right">
@@ -241,7 +326,7 @@ function ShippingPointSettings() {
           </table>
         </div>
 
-        {shippingPoints.length === 0 && (
+        {shippingPoints.length === 0 && !loading && (
           <div className="text-center py-12">
             <div className="mx-auto h-12 w-12 text-muted-foreground">
               <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
