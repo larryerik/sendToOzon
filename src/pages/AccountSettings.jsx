@@ -67,6 +67,12 @@ function AccountSettings() {
 
     setSaving(true);
     try {
+      console.log('保存凭据到数据库:', {
+        user_id: user.id,
+        client_id: accountInfo.client_id,
+        api_key: accountInfo.api_key,
+      });
+      
       const { data, error } = await supabase
         .from('account_settings')
         .upsert({
@@ -78,7 +84,10 @@ function AccountSettings() {
         });
 
       if (error) throw error;
-
+      
+      console.log('保存成功:', data);
+      // 通知其他组件凭据已更新
+      window.dispatchEvent(new CustomEvent('ozonCredentialsUpdated'));
       setIsEditing(false);
     } catch (error) {
       console.error('保存账户信息失败:', error);

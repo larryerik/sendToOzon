@@ -1,12 +1,19 @@
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { useState, useEffect } from 'react';
+import { useAuth } from '../contexts/AuthContext';
+import { supabase } from '../supabaseClient';
 
 function EditPlan() {
   const { id } = useParams();
+  const location = useLocation();
   const navigate = useNavigate();
+  const { user } = useAuth();
+  
+  // 从location.state获取传递的数据
+  const { planName: initialPlanName, products: initialProducts, clusters: initialClusters, calculationResults } = location.state || {};
 
-  const [planName, setPlanName] = useState('2024年1月发货计划');
-  const [products, setProducts] = useState([
+  const [planName, setPlanName] = useState(initialPlanName || '2024年1月发货计划');
+  const [products, setProducts] = useState(initialProducts || [
     {
       id: 1,
       sku: 'SKU-001',
@@ -39,44 +46,93 @@ function EditPlan() {
     },
   ]);
 
+  // 根据计算结果初始化集群分配数据
+  const initializeClusterAllocations = () => {
+    if (calculationResults && calculationResults.length > 0) {
+      // 根据计算结果创建集群分配数据
+      const clusterMap = new Map();
+      
+      calculationResults.forEach(result => {
+        if (!clusterMap.has(result.cluster_id)) {
+          clusterMap.set(result.cluster_id, {
+            id: result.cluster_id,
+            clusterName: result.cluster_name,
+            shippingPoint: '',
+            productRecommendations: [],
+            allocations: [],
+            pallets: 0,
+            palletAllocations: {}
+          });
+        }
+        
+        const cluster = clusterMap.get(result.cluster_id);
+        cluster.productRecommendations.push({
+          productId: result.product_id,
+          recommendedBoxes: result.recommended_boxes
+        });
+        
+        cluster.allocations.push({
+          productId: result.product_id,
+          boxes: result.recommended_boxes
+        });
+      });
+      
+      return Array.from(clusterMap.values());
+    } else if (initialClusters && initialClusters.length > 0) {
+      // 如果没有计算结果但有初始集群数据
+      return initialClusters.map(cluster => ({
+        id: cluster.id,
+        clusterName: cluster.nameCn || cluster.name,
+        shippingPoint: '',
+        productRecommendations: [],
+        allocations: [],
+        pallets: 0,
+        palletAllocations: {}
+      }));
+    } else {
+      // 默认集群数据
+      return [
+        {
+          id: 1,
+          clusterName: '莫斯科集群',
+          shippingPoint: '',
+          productRecommendations: [
+            { productId: 1, recommendedBoxes: 3 },
+            { productId: 2, recommendedBoxes: 2 }
+          ],
+          allocations: [
+            { productId: 1, boxes: 3 },
+            { productId: 2, boxes: 2 }
+          ],
+          pallets: 2,
+          palletAllocations: {
+            0: { 1: 2, 2: 1 },
+            1: { 1: 1, 2: 1 }
+          }
+        },
+        {
+          id: 2,
+          clusterName: '圣彼得堡集群',
+          shippingPoint: '',
+          productRecommendations: [
+            { productId: 1, recommendedBoxes: 2 },
+            { productId: 2, recommendedBoxes: 1 }
+          ],
+          allocations: [
+            { productId: 1, boxes: 2 },
+            { productId: 2, boxes: 1 }
+          ],
+          pallets: 1,
+          palletAllocations: {
+            0: { 1: 2, 2: 1 }
+          }
+        },
+      ];
+    }
+  };
+
   // 集群分配数据，包含每个产品在各集群的分配情况
-  const [clusterAllocations, setClusterAllocations] = useState([
-    {
-      id: 1,
-      clusterName: '莫斯科集群',
-      shippingPoint: '', // 添加发货点字段
-      productRecommendations: [
-        { productId: 1, recommendedBoxes: 3 },
-        { productId: 2, recommendedBoxes: 2 }
-      ],
-      allocations: [
-        { productId: 1, boxes: 3 },
-        { productId: 2, boxes: 2 }
-      ],
-      pallets: 2,
-      palletAllocations: {
-        0: { 1: 2, 2: 1 }, // 托盘0: 产品1分配2箱, 产品2分配1箱
-        1: { 1: 1, 2: 1 }  // 托盘1: 产品1分配1箱, 产品2分配1箱
-      }
-    },
-    {
-      id: 2,
-      clusterName: '圣彼得堡集群',
-      shippingPoint: '', // 添加发货点字段
-      productRecommendations: [
-        { productId: 1, recommendedBoxes: 2 },
-        { productId: 2, recommendedBoxes: 1 }
-      ],
-      allocations: [
-        { productId: 1, boxes: 2 },
-        { productId: 2, boxes: 1 }
-      ],
-      pallets: 1,
-      palletAllocations: {
-        0: { 1: 2, 2: 1 }  // 托盘0: 产品1分配2箱, 产品2分配1箱
-      }
-    },
-  ]);
+  const [clusterAllocations, setClusterAllocations] = useState(initializeClusterAllocations());
 
   // 弹窗状态
   const [isBoxModalOpen, setIsBoxModalOpen] = useState(false);
@@ -240,9 +296,108 @@ function EditPlan() {
     setIsPalletModalOpen(true);
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     console.log('保存计划', { planName, products, clusterAllocations });
-    navigate('/shipping-plans');
+    
+    try {
+      // 保存计划信息到数据库
+      const { data: planData, error: planError } = await supabase
+        .from('shipping_plans')
+        .insert([
+          {
+            name: planName,
+            user_id: user.id,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+          }
+        ])
+        .select()
+        .single();
+
+      if (planError) {
+        console.error('保存计划信息失败:', planError);
+        alert('保存计划信息失败: ' + planError.message);
+        return;
+      }
+
+      const planId = planData.id;
+      
+      // 保存产品信息到数据库
+      const productInserts = products.map(product => ({
+        plan_id: planId,
+        sku: product.sku,
+        ozon_id: product.ozonId,
+        box_count: product.boxCount,
+        items_per_box: product.itemsPerBox,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }));
+      
+      const { error: productError } = await supabase
+        .from('plan_products')
+        .insert(productInserts);
+
+      if (productError) {
+        console.error('保存产品信息失败:', productError);
+        alert('保存产品信息失败: ' + productError.message);
+        return;
+      }
+      
+      // 保存集群分配信息到数据库
+      const clusterInserts = clusterAllocations.map(cluster => ({
+        plan_id: planId,
+        cluster_id: cluster.id,
+        cluster_name: cluster.clusterName,
+        shipping_point: cluster.shippingPoint,
+        pallets: cluster.pallets,
+        pallet_allocations: cluster.palletAllocations,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }));
+      
+      const { error: clusterError } = await supabase
+        .from('plan_clusters')
+        .insert(clusterInserts);
+
+      if (clusterError) {
+        console.error('保存集群信息失败:', clusterError);
+        alert('保存集群信息失败: ' + clusterError.message);
+        return;
+      }
+      
+      // 保存产品分配信息到数据库
+      const allocationInserts = [];
+      clusterAllocations.forEach(cluster => {
+        cluster.allocations.forEach(allocation => {
+          allocationInserts.push({
+            plan_id: planId,
+            cluster_id: cluster.id,
+            product_id: allocation.productId,
+            boxes: allocation.boxes,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+          });
+        });
+      });
+      
+      if (allocationInserts.length > 0) {
+        const { error: allocationError } = await supabase
+          .from('plan_allocations')
+          .insert(allocationInserts);
+
+        if (allocationError) {
+          console.error('保存分配信息失败:', allocationError);
+          alert('保存分配信息失败: ' + allocationError.message);
+          return;
+        }
+      }
+      
+      alert('计划保存成功！');
+      navigate('/shipping-plans');
+    } catch (err) {
+      console.error('保存计划时出错:', err);
+      alert('保存计划时出错: ' + err.message);
+    }
   };
 
   // 箱数弹窗组件
@@ -585,185 +740,177 @@ function EditPlan() {
 
   return (
     <div className="space-y-6">
-      {/* 页面标题 */}
-      <div className="flex items-center gap-2">
-        <button
-          onClick={() => navigate('/shipping-plans')}
-          className="btn btn-ghost p-0"
-        >
-          <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-            <path fillRule="evenodd" d="M9.707 16.707a1 1 0 01-1.414 0l-6-6a1 1 0 010-1.414l6-6a1 1 0 011.414 1.414L5.414 9H17a1 1 0 110 2H5.414l4.293 4.293a1 1 0 010 1.414z" clipRule="evenodd" />
-          </svg>
-        </button>
-        <h1 className="text-2xl font-bold tracking-tight">编辑发货计划</h1>
+      {/* 页面标题和操作按钮 */}
+      <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-4">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight">编辑发货计划</h1>
+          <p className="text-muted-foreground">管理您的发货计划详情</p>
+        </div>
+        <div className="flex gap-2">
+          <button
+            onClick={handleSave}
+            className="btn btn-default"
+          >
+            保存计划
+          </button>
+          <button
+            onClick={() => navigate('/shipping-plans')}
+            className="btn btn-outline"
+          >
+            返回
+          </button>
+        </div>
       </div>
 
       {/* 计划信息 */}
       <div className="card">
-        <div className="card-content">
-          <div className="space-y-4">
-            <div>
-              <label className="label">计划名称</label>
-              <input
-                type="text"
-                value={planName}
-                onChange={(e) => setPlanName(e.target.value)}
-                className="input"
-              />
-            </div>
+        <div className="space-y-4">
+          <div className="flex items-center gap-4">
+            <label className="text-sm font-medium text-gray-700">计划名称</label>
+            <input
+              type="text"
+              value={planName}
+              onChange={(e) => setPlanName(e.target.value)}
+              className="input flex-1 rounded-md border border-gray-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+            />
           </div>
         </div>
       </div>
 
+      {/* 计算结果摘要 */}
+      {calculationResults && calculationResults.length > 0 && (
+        <div className="card">
+          <div className="border-b border-gray-200 p-4">
+            <h3 className="text-lg font-medium text-gray-900">计算结果摘要</h3>
+            <p className="text-sm text-gray-500">基于历史数据和安全库存计算的推荐发货箱数</p>
+          </div>
+          <div className="p-4 space-y-3 max-h-60 overflow-y-auto">
+            {calculationResults.map((result, index) => (
+              <div key={index} className="flex items-center justify-between p-3 bg-gray-50 rounded-md">
+                <div>
+                  <div className="font-medium text-gray-900">{result.sku}</div>
+                  <div className="text-sm text-gray-500">{result.cluster_name}</div>
+                </div>
+                <div className="text-right">
+                  <div className="font-medium text-gray-900">{Math.round(result.recommended_boxes)} 箱</div>
+                  <div className="text-xs text-gray-500">{result.reason}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* 产品列表 */}
       <div className="card">
-        <div className="card-header">
-          <h3 className="card-title">产品列表</h3>
+        <div className="border-b border-gray-200 p-4 flex justify-between items-center">
+          <h3 className="text-lg font-medium text-gray-900">产品列表</h3>
+          <span className="text-sm text-gray-500">{products.length} 个产品</span>
         </div>
-        <div className="card-content">
-          <div className="overflow-x-auto">
-            <table className="table">
-              <thead className="table-header">
-                <tr>
-                  <th className="table-head">SKU</th>
-                  <th className="table-head">Ozon ID</th>
-                  <th className="table-head">箱数</th>
-                  <th className="table-head">单箱数量</th>
-                  <th className="table-head">总数量</th>
-                  <th className="table-head text-right">操作</th>
-                </tr>
-              </thead>
-              <tbody className="table-body">
-                {products.map((product) => (
-                  <tr key={product.id} className="table-row">
-                    <td className="table-cell font-medium">{product.sku}</td>
-                    <td className="table-cell">{product.ozonId}</td>
-                    <td className="table-cell">
-                      <input
-                        type="number"
-                        value={product.boxCount}
-                        onChange={(e) =>
-                          handleUpdateProduct(product.id, 'boxCount', e.target.value)
-                        }
-                        className="input w-24"
-                        min="1"
-                      />
-                    </td>
-                    <td className="table-cell">
-                      <input
-                        type="number"
-                        value={product.itemsPerBox}
-                        onChange={(e) =>
-                          handleUpdateProduct(product.id, 'itemsPerBox', e.target.value)
-                        }
-                        className="input w-24"
-                        min="1"
-                      />
-                    </td>
-                    <td className="table-cell font-medium">
-                      {product.boxCount * product.itemsPerBox}
-                    </td>
-                    <td className="table-cell text-right">
-                      <button
-                        onClick={() => handleRemoveProduct(product.id)}
-                        className="btn btn-destructive"
-                      >
-                        删除
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+        <div className="divide-y divide-gray-200">
+          {products.map((product) => (
+            <div key={product.id} className="flex items-center justify-between p-3">
+              <div className="flex items-center gap-4">
+                <div className="font-medium text-gray-900">{product.sku}</div>
+                <div className="text-sm text-gray-500">Ozon ID: {product.ozonId}</div>
+              </div>
+              <div className="flex items-center gap-4">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm text-gray-500">箱数:</span>
+                  <input
+                    type="number"
+                    value={product.boxCount}
+                    onChange={(e) =>
+                      handleUpdateProduct(product.id, 'boxCount', e.target.value)
+                    }
+                    className="input w-24"
+                    min="1"
+                  />
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-sm text-gray-500">单箱数量:</span>
+                  <input
+                    type="number"
+                    value={product.itemsPerBox}
+                    onChange={(e) =>
+                      handleUpdateProduct(product.id, 'itemsPerBox', e.target.value)
+                    }
+                    className="input w-24"
+                    min="1"
+                  />
+                </div>
+                <div className="text-sm text-gray-500">
+                  总数量: {product.boxCount * product.itemsPerBox}
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => handleRemoveProduct(product.id)}
+                  className="btn btn-destructive"
+                >
+                  删除
+                </button>
+              </div>
+            </div>
+          ))}
         </div>
       </div>
 
       {/* 集群分配情况 */}
       <div className="card">
-        <div className="card-header">
-          <h3 className="card-title">集群分配情况</h3>
+        <div className="border-b border-gray-200 p-4 flex justify-between items-center">
+          <h3 className="text-lg font-medium text-gray-900">集群分配情况</h3>
+          <span className="text-sm text-gray-500">{clusterAllocations.length} 个集群</span>
         </div>
-        <div className="card-content">
-          <div className="overflow-x-auto">
-            <table className="table">
-              <thead className="table-header">
-                <tr>
-                  <th className="table-head">集群名称</th>
-                  <th className="table-head">选择发货点</th>
-                  <th className="table-head">纸箱</th>
-                  <th className="table-head">托盘</th>
-                  <th className="table-head">总箱数</th>
-                  <th className="table-head">总数量</th>
-                  <th className="table-head text-right">操作</th>
-                </tr>
-              </thead>
-              <tbody className="table-body">
-                {clusterAllocations.map((cluster) => (
-                  <tr key={cluster.id} className="table-row">
-                    <td className="table-cell font-medium">{cluster.clusterName}</td>
-                    <td className="table-cell">
-                      <select
-                        value={cluster.shippingPoint}
-                        onChange={(e) => updateShippingPoint(cluster.id, e.target.value)}
-                        className="input w-32 text-sm h-8"
-                      >
-                        <option value="">请选择发货点</option>
-                        {shippingPoints.map((point) => (
-                          <option key={point.id} value={point.name}>
-                            {point.name}
-                          </option>
-                        ))}
-                      </select>
-                    </td>
-                    <td className="table-cell">
-                      <button
-                        onClick={() => openBoxModal(cluster.id)}
-                        className="btn btn-outline"
-                      >
-                        编辑箱数
-                      </button>
-                    </td>
-                    <td className="table-cell">
-                      <button
-                        onClick={() => openPalletModal(cluster.id)}
-                        className="btn btn-outline"
-                      >
-                        编辑托盘
-                      </button>
-                    </td>
-                    <td className="table-cell font-medium">{getTotalBoxesForCluster(cluster.id)}</td>
-                    <td className="table-cell font-medium">{getTotalItemsForCluster(cluster.id)}</td>
-                    <td className="table-cell text-right">
-                      <button
-                        onClick={() => handleRemoveCluster(cluster.id)}
-                        className="btn btn-destructive"
-                      >
-                        删除
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+        <div className="divide-y divide-gray-200">
+          {clusterAllocations.map((cluster) => (
+            <div key={cluster.id} className="flex items-center justify-between p-3">
+              <div className="flex items-center gap-4">
+                <div className="font-medium text-gray-900">{cluster.clusterName}</div>
+                <select
+                  value={cluster.shippingPoint}
+                  onChange={(e) => updateShippingPoint(cluster.id, e.target.value)}
+                  className="input w-32 text-sm h-8"
+                >
+                  <option value="">请选择发货点</option>
+                  {shippingPoints.map((point) => (
+                    <option key={point.id} value={point.name}>
+                      {point.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex items-center gap-4">
+                <button
+                  onClick={() => openBoxModal(cluster.id)}
+                  className="btn btn-outline"
+                >
+                  编辑箱数
+                </button>
+                <button
+                  onClick={() => openPalletModal(cluster.id)}
+                  className="btn btn-outline"
+                >
+                  编辑托盘
+                </button>
+              </div>
+              <div className="text-sm text-gray-500">
+                总箱数: {getTotalBoxesForCluster(cluster.id)}
+              </div>
+              <div className="text-sm text-gray-500">
+                总数量: {getTotalItemsForCluster(cluster.id)}
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => handleRemoveCluster(cluster.id)}
+                  className="btn btn-destructive"
+                >
+                  删除
+                </button>
+              </div>
+            </div>
+          ))}
         </div>
-      </div>
-
-      {/* 操作按钮 */}
-      <div className="flex justify-end gap-3">
-        <button
-          onClick={() => navigate('/shipping-plans')}
-          className="btn btn-outline"
-        >
-          取消
-        </button>
-        <button
-          onClick={handleSave}
-          className="btn btn-default"
-        >
-          保存修改
-        </button>
       </div>
 
       {/* 弹窗组件 */}
