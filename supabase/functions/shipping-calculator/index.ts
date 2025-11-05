@@ -21,7 +21,7 @@ type ClusterData = {
 
 type ProductHistory = {
   id: string;
-  ozon_id: string;
+  sku: string;
   cluster: string;
   stocks: number;
   daily_sales: number;
@@ -94,28 +94,49 @@ Deno.serve(async (req: Request) => {
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
     // 批量获取所有相关的历史数据
-    const ozonIds = products.map(p => p.ozonId);
-    const clusterNames = clusters.map(c => c.name);
+    const skus = products.map(p => p.sku);
     
+    // 仅按 sku 查询，避免因集群名称不一致导致漏数
     const { data: historyDataList, error: historyError } = await supabase
       .from('products')
-      .select('ozon_id, cluster, stocks, daily_sales')
-      .in('ozon_id', ozonIds)
-      .in('cluster', clusterNames);
+      .select('sku, cluster, stocks, daily_sales, updated_at, created_at')
+      .in('sku', skus);
 
     if (historyError) {
       console.error('数据库查询错误:', historyError);
       // 如果查询失败，使用默认值继续计算
     }
 
-    // 创建历史数据映射以便快速查找
-    const historyMap = new Map<string, ProductHistory>();
+    // 创建按 sku 分组的历史数据映射，内部按 cluster 归并并保留最新记录
+    const historyBySku = new Map<string, ProductHistory[]>();
     if (historyDataList) {
+      // 先按 sku 聚合
+      const tempMap = new Map<string, ProductHistory[]>();
       historyDataList.forEach(item => {
-        const key = `${item.ozon_id}-${item.cluster}`;
-        historyMap.set(key, item);
+        const list = tempMap.get(item.sku) || [];
+        list.push(item as ProductHistory);
+        tempMap.set(item.sku, list);
       });
+      // 对每个 sku：按 cluster 归并，保留最新的 updated_at/created_at
+      for (const [sku, list] of tempMap.entries()) {
+        const clusterKeyMap = new Map<string, ProductHistory>();
+        const toKey = (s?: string) => (s || '').toString().trim().toLowerCase();
+        for (const rec of list) {
+          const key = toKey(rec.cluster);
+          const prev = clusterKeyMap.get(key);
+          if (!prev) {
+            clusterKeyMap.set(key, rec);
+          } else {
+            const prevTime = new Date(prev.updated_at || prev.created_at || 0).getTime();
+            const curTime = new Date((rec as any).updated_at || (rec as any).created_at || 0).getTime();
+            if (curTime >= prevTime) clusterKeyMap.set(key, rec);
+          }
+        }
+        historyBySku.set(sku, Array.from(clusterKeyMap.values()));
+      }
     }
+
+    const normalize = (s?: string) => (s || '').toString().trim().toLowerCase();
 
     // 计算结果数组
     const results: CalculationResult[] = [];
@@ -128,8 +149,18 @@ Deno.serve(async (req: Request) => {
       // 获取该产品在各集群的历史数据
       const clusterHistoryData: ClusterHistoryData[] = [];
       for (const cluster of clusters) {
-        const key = `${product.ozonId}-${cluster.name}`;
-        const historyData = historyMap.get(key);
+        const candidates = historyBySku.get(product.sku) || [];
+        const targetName = normalize(cluster.name);
+        let historyData = candidates.find(h => targetName === normalize(h.cluster));
+        // 回退1：若没匹配到且仅有一条候选，直接使用该条
+        if (!historyData && candidates.length === 1) {
+          historyData = candidates[0];
+        }
+        // 回退2：若仍未匹配，优先选择 cluster 为空/空白 的最新记录
+        if (!historyData) {
+          const emptyCluster = candidates.find(h => normalize(h.cluster) === '');
+          if (emptyCluster) historyData = emptyCluster;
+        }
         clusterHistoryData.push({
           cluster,
           historyData,
@@ -138,69 +169,73 @@ Deno.serve(async (req: Request) => {
         });
       }
       
-      // 计算各集群的权重（基于日销量）
-      const totalDailySales = clusterHistoryData.reduce((sum, item) => sum + item.dailySales, 0);
-      
-      // 存储各集群的分配箱数
-      const clusterAllocations: ClusterAllocation[] = [];
-      let totalAllocatedBoxes = 0;
-      
-      // 为每个集群计算分配箱数（确保为整数）
-      for (let i = 0; i < clusterHistoryData.length; i++) {
-        const item = clusterHistoryData[i];
-        const { cluster, dailySales } = item;
-        
-        // 基于日销量占比分配箱数
-        let allocatedBoxes = 0;
-        if (totalDailySales > 0) {
-          const ratio = dailySales / totalDailySales;
-          // 使用四舍五入确保为整数
-          allocatedBoxes = Math.round(product.boxCount * ratio);
-        } else {
-          // 如果总日销量为0，则平均分配
-          allocatedBoxes = Math.round(product.boxCount / clusters.length);
+      // 新算法：先算需求，再按需求占比分配用户的总箱数（不超过各自需求上限）
+      const needPerCluster = clusterHistoryData.map((item) => {
+        const demandItems = (item.dailySales || 0) * item.cluster.safeDays;
+        const needItems = Math.max(0, demandItems - (item.stock || 0));
+        const needBoxes = Math.ceil(needItems / product.itemsPerBox);
+        return {
+          cluster: item.cluster,
+          stock: item.stock || 0,
+          dailySales: item.dailySales || 0,
+          demandItems,
+          needItems,
+          needBoxes,
+        };
+      });
+
+      const totalNeedBoxes = needPerCluster.reduce((sum, n) => sum + n.needBoxes, 0);
+      const targetTotalBoxes = Math.min(product.boxCount, totalNeedBoxes);
+
+      // 若无需求，全部给0
+      if (targetTotalBoxes === 0) {
+        for (const n of needPerCluster) {
+          results.push({
+            cluster_id: n.cluster.id,
+            cluster_name: n.cluster.nameCn || n.cluster.name,
+            product_id: product.id,
+            sku: product.sku,
+            recommended_boxes: 0,
+            reason: `推荐0箱（需求0），当前库存${n.stock}，日销量${n.dailySales}，建议维持${n.cluster.safeDays}天安全库存`,
+          });
         }
-        
-        clusterAllocations.push({cluster, boxes: allocatedBoxes});
-        totalAllocatedBoxes += allocatedBoxes;
+        continue;
       }
-      
-      // 调整分配以确保总箱数等于用户指定的箱数
-      const difference = product.boxCount - totalAllocatedBoxes;
-      if (difference !== 0 && clusterAllocations.length > 0) {
-        // 将差值分配给日销量最高的集群
-        const maxSalesCluster = clusterAllocations.reduce((max, current) => {
-          const currentDailySales = clusterHistoryData.find(chd => chd.cluster.id === current.cluster.id)?.dailySales || 0;
-          const maxDailySales = clusterHistoryData.find(chd => chd.cluster.id === max.cluster.id)?.dailySales || 0;
-          return currentDailySales > maxDailySales ? current : max;
-        });
-        maxSalesCluster.boxes += difference;
+
+      // 按需求占比初始分配（向下取整），记录小数余数，随后用最大余数法补齐到 targetTotalBoxes，且不超过各自需求上限
+      const allocations = needPerCluster.map((n) => {
+        const ratio = n.needBoxes / totalNeedBoxes;
+        const ideal = targetTotalBoxes * ratio;
+        const base = Math.min(n.needBoxes, Math.floor(ideal));
+        const remainder = ideal - base;
+        return { n, base, remainder, allocated: base };
+      });
+
+      let allocatedSum = allocations.reduce((sum, a) => sum + a.allocated, 0);
+      let remain = targetTotalBoxes - allocatedSum;
+      if (remain > 0) {
+        const byRemainder = [...allocations].sort((a, b) => b.remainder - a.remainder);
+        let i = 0;
+        while (remain > 0 && i < byRemainder.length * 5) {
+          for (const a of byRemainder) {
+            if (remain <= 0) break;
+            if (a.allocated < a.n.needBoxes) {
+              a.allocated += 1;
+              remain -= 1;
+            }
+          }
+          i += 1;
+        }
       }
-      
-      // 为每个集群计算推荐发货箱数（包括安全库存）
-      for (const allocation of clusterAllocations) {
-        const { cluster, boxes: allocatedBoxes } = allocation;
-        
-        // 获取该集群的历史数据
-        const historyItem = clusterHistoryData.find(item => item.cluster.id === cluster.id);
-        const stock = historyItem?.stock || 0;
-        const dailySales = historyItem?.dailySales || 1;
-        
-        // 计算分配的物品数量
-        const allocatedItems = allocatedBoxes * product.itemsPerBox;
-        
-        // 计算安全库存需求
-        const safetyStock = dailySales * cluster.safeDays;
-        const recommendedItems = Math.max(0, allocatedItems + safetyStock - stock);
-        const recommendedBoxes = Math.ceil(recommendedItems / product.itemsPerBox);
-        
+
+      for (const a of allocations) {
         results.push({
-          cluster_id: cluster.id,
-          cluster_name: cluster.nameCn || cluster.name,
+          cluster_id: a.n.cluster.id,
+          cluster_name: a.n.cluster.nameCn || a.n.cluster.name,
           product_id: product.id,
           sku: product.sku,
-          recommended_boxes: recommendedBoxes,
-          reason: `分配${allocatedBoxes}箱，当前库存${stock}，日销量${dailySales}，建议维持${cluster.safeDays}天安全库存`
+          recommended_boxes: a.allocated,
+          reason: `推荐${a.allocated}箱（需求${a.n.needBoxes}箱），当前库存${a.n.stock}，日销量${a.n.dailySales}，建议维持${a.n.cluster.safeDays}天安全库存`,
         });
       }
     }

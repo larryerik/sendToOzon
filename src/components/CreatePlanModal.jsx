@@ -213,16 +213,17 @@ function CreatePlanModal({ isOpen, onClose }) {
 
   const toggleCluster = (cluster) => {
     console.log('切换集群:', cluster);
-    const isSelected = selectedClusters.find((c) => c.id === cluster.id);
-    if (isSelected) {
-      console.log('取消选择集群:', cluster.id);
-      setSelectedClusters(selectedClusters.filter((c) => c.id !== cluster.id));
-    } else {
-      console.log('选择集群:', cluster.id);
-      setSelectedClusters([...selectedClusters, cluster]);
-    }
-    console.log('当前选择的集群:', selectedClusters);
+    setSelectedClusters((prev) => {
+      const isSelected = prev.find((c) => c.id === cluster.id);
+      const next = isSelected ? prev.filter((c) => c.id !== cluster.id) : [...prev, cluster];
+      return next;
+    });
   };
+
+  // 集群选择变更后再打印，避免读取到旧状态
+  useEffect(() => {
+    console.log('当前选择的集群:', selectedClusters);
+  }, [selectedClusters]);
 
   // 当模态框关闭时，清空搜索结果
   const handleClose = useCallback(() => {
@@ -295,7 +296,7 @@ function CreatePlanModal({ isOpen, onClose }) {
         })),
         clusters: selectedClusters.map(cluster => ({
           id: cluster.id,
-          name: cluster.name,
+          name: cluster.name || cluster.name_cn, // 确保名称不为空，便于历史匹配
           nameCn: cluster.name_cn || cluster.name,
           safeDays: cluster.safe_days || 7
         })),

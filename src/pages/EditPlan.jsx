@@ -30,21 +30,27 @@ function EditPlan() {
     },
   ]);
 
-  // 模拟发货点数据
-  const [shippingPoints] = useState([
-    {
-      id: 1,
-      name: 'Moscow Warehouse',
-      pointId: 'WH-MSK-001',
-      supportTypes: ['box', 'pallet'],
-    },
-    {
-      id: 2,
-      name: 'SPB Warehouse',
-      pointId: 'WH-SPB-001',
-      supportTypes: ['box'],
-    },
-  ]);
+  // 发货点数据（来自 ShippingPointSettings 保存的 shipping_points 表）
+  const [shippingPoints, setShippingPoints] = useState([]);
+  const [shippingPointsLoading, setShippingPointsLoading] = useState(false);
+  useEffect(() => {
+    const fetchShippingPoints = async () => {
+      setShippingPointsLoading(true);
+      try {
+        const { data, error } = await supabase
+          .from('shipping_points')
+          .select('*')
+          .order('id');
+        if (error) throw error;
+        setShippingPoints(data || []);
+      } catch (err) {
+        console.error('获取发货点失败:', err);
+      } finally {
+        setShippingPointsLoading(false);
+      }
+    };
+    fetchShippingPoints();
+  }, []);
 
   // 根据计算结果初始化集群分配数据
   const initializeClusterAllocations = () => {
@@ -164,7 +170,14 @@ function EditPlan() {
   const handleUpdateProduct = (productId, field, value) => {
     setProducts(
       products.map((p) =>
-        p.id === productId ? { ...p, [field]: parseInt(value) || 0 } : p
+        p.id === productId
+          ? {
+              ...p,
+              [field]: field === 'boxCount' || field === 'itemsPerBox'
+                ? (parseInt(value) || 0)
+                : value,
+            }
+          : p
       )
     );
   };
@@ -298,6 +311,12 @@ function EditPlan() {
 
   const handleSave = async () => {
     console.log('保存计划', { planName, products, clusterAllocations });
+    // 校验：箱条码为必填
+    const missingBarcode = products.find(p => !p.barcode || String(p.barcode).trim() === '');
+    if (missingBarcode) {
+      alert(`请为所有产品填写箱条码（缺少: ${missingBarcode.sku}）`);
+      return;
+    }
     
     try {
       // 保存计划信息到数据库
@@ -777,8 +796,8 @@ function EditPlan() {
         </div>
       </div>
 
-      {/* 计算结果摘要 */}
-      {calculationResults && calculationResults.length > 0 && (
+      {/* 计算结果摘要（隐藏） */}
+      {false && calculationResults && calculationResults.length > 0 && (
         <div className="card">
           <div className="border-b border-gray-200 p-4">
             <h3 className="text-lg font-medium text-gray-900">计算结果摘要</h3>
@@ -812,31 +831,27 @@ function EditPlan() {
             <div key={product.id} className="flex items-center justify-between p-3">
               <div className="flex items-center gap-4">
                 <div className="font-medium text-gray-900">{product.sku}</div>
-                <div className="text-sm text-gray-500">Ozon ID: {product.ozonId}</div>
               </div>
               <div className="flex items-center gap-4">
                 <div className="flex items-center gap-2">
                   <span className="text-sm text-gray-500">箱数:</span>
-                  <input
-                    type="number"
-                    value={product.boxCount}
-                    onChange={(e) =>
-                      handleUpdateProduct(product.id, 'boxCount', e.target.value)
-                    }
-                    className="input w-24"
-                    min="1"
-                  />
+                  <span className="text-sm text-gray-900 font-medium">{product.boxCount}</span>
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="text-sm text-gray-500">单箱数量:</span>
+                  <span className="text-sm text-gray-900 font-medium">{product.itemsPerBox}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-sm text-gray-500">箱条码:</span>
                   <input
-                    type="number"
-                    value={product.itemsPerBox}
+                    type="text"
+                    value={product.barcode || ''}
                     onChange={(e) =>
-                      handleUpdateProduct(product.id, 'itemsPerBox', e.target.value)
+                      handleUpdateProduct(product.id, 'barcode', e.target.value)
                     }
-                    className="input w-24"
-                    min="1"
+                    className={`input w-56 ${!product.barcode || String(product.barcode).trim() === '' ? 'border-red-400' : ''}`}
+                    required
+                    placeholder="请输入箱条码"
                   />
                 </div>
                 <div className="text-sm text-gray-500">
@@ -870,11 +885,12 @@ function EditPlan() {
                 <select
                   value={cluster.shippingPoint}
                   onChange={(e) => updateShippingPoint(cluster.id, e.target.value)}
-                  className="input w-32 text-sm h-8"
+                  className="input w-48 text-sm h-8"
+                  disabled={shippingPointsLoading}
                 >
-                  <option value="">请选择发货点</option>
+                  <option value="">{shippingPointsLoading ? '加载中...' : '请选择发货点'}</option>
                   {shippingPoints.map((point) => (
-                    <option key={point.id} value={point.name}>
+                    <option key={point.id} value={point.point_id}>
                       {point.name}
                     </option>
                   ))}
