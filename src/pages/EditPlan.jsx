@@ -297,6 +297,20 @@ function EditPlan() {
     return directItems + palletItems;
   };
 
+  // 计算某产品在所有集群中的总箱数
+  const getTotalBoxesForProduct = (productId) => {
+    return clusterAllocations.reduce((sum, cluster) => {
+      const alloc = cluster.allocations.find(a => a.productId === productId);
+      return sum + (alloc ? alloc.boxes : 0);
+    }, 0);
+  };
+
+  // 计算某产品在所有集群中的总数量（件）
+  const getTotalItemsForProduct = (product) => {
+    const totalBoxes = getTotalBoxesForProduct(product.id);
+    return totalBoxes * product.itemsPerBox;
+  };
+
   // 打开箱数弹窗
   const openBoxModal = (clusterId) => {
     setCurrentClusterId(clusterId);
@@ -835,7 +849,7 @@ function EditPlan() {
               <div className="flex items-center gap-4">
                 <div className="flex items-center gap-2">
                   <span className="text-sm text-gray-500">箱数:</span>
-                  <span className="text-sm text-gray-900 font-medium">{product.boxCount}</span>
+                  <span className="text-sm text-gray-900 font-medium">{getTotalBoxesForProduct(product.id)}</span>
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="text-sm text-gray-500">单箱数量:</span>
@@ -855,17 +869,10 @@ function EditPlan() {
                   />
                 </div>
                 <div className="text-sm text-gray-500">
-                  总数量: {product.boxCount * product.itemsPerBox}
+                  总数量: {getTotalItemsForProduct(product)}
                 </div>
               </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => handleRemoveProduct(product.id)}
-                  className="btn btn-destructive"
-                >
-                  删除
-                </button>
-              </div>
+              <div className="flex items-center gap-2"></div>
             </div>
           ))}
         </div>

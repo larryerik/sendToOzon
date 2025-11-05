@@ -185,7 +185,7 @@ Deno.serve(async (req: Request) => {
       });
 
       const totalNeedBoxes = needPerCluster.reduce((sum, n) => sum + n.needBoxes, 0);
-      const targetTotalBoxes = Math.min(product.boxCount, totalNeedBoxes);
+      const targetTotalBoxes = product.boxCount; // 严格等于用户输入箱数
 
       // 若无需求，全部给0
       if (targetTotalBoxes === 0) {
@@ -202,11 +202,11 @@ Deno.serve(async (req: Request) => {
         continue;
       }
 
-      // 按需求占比初始分配（向下取整），记录小数余数，随后用最大余数法补齐到 targetTotalBoxes，且不超过各自需求上限
+      // 按需求占比初始分配（向下取整），记录小数余数，随后用最大余数法补齐到 targetTotalBoxes
       const allocations = needPerCluster.map((n) => {
-        const ratio = n.needBoxes / totalNeedBoxes;
-        const ideal = targetTotalBoxes * ratio;
-        const base = Math.min(n.needBoxes, Math.floor(ideal));
+        const ratio = totalNeedBoxes > 0 ? (n.needBoxes / totalNeedBoxes) : 0;
+        const ideal = totalNeedBoxes > 0 ? (targetTotalBoxes * ratio) : 0;
+        const base = Math.floor(ideal);
         const remainder = ideal - base;
         return { n, base, remainder, allocated: base };
       });
@@ -219,10 +219,8 @@ Deno.serve(async (req: Request) => {
         while (remain > 0 && i < byRemainder.length * 5) {
           for (const a of byRemainder) {
             if (remain <= 0) break;
-            if (a.allocated < a.n.needBoxes) {
-              a.allocated += 1;
-              remain -= 1;
-            }
+            a.allocated += 1;
+            remain -= 1;
           }
           i += 1;
         }
