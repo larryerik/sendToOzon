@@ -4,7 +4,7 @@ import { getOzonProducts } from '../utils/ozonApiClient';
 import { supabase } from '../supabaseClient';
 import { useAuth } from '../contexts/AuthContext';
 
-function CreatePlanModal({ isOpen, onClose }) {
+function CreatePlanModal({ isOpen, onClose, onPlanCreated = () => {} }) {
   const navigate = useNavigate();
   const { user } = useAuth(); // 获取当前用户信息
   const [planName, setPlanName] = useState(''); // 添加计划名称状态
@@ -25,6 +25,7 @@ function CreatePlanModal({ isOpen, onClose }) {
   // 计算结果状态
   const [calculationResults, setCalculationResults] = useState([]);
   const [isCalculating, setIsCalculating] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
 
   // 获取用户的Ozon凭据
   useEffect(() => {
@@ -191,7 +192,12 @@ function CreatePlanModal({ isOpen, onClose }) {
     if (!selectedProducts.find((p) => p.id === product.id)) {
       setSelectedProducts([
         ...selectedProducts,
-        { ...product, boxCount: 1, itemsPerBox: 10 },
+        {
+          ...product,
+          boxCount: 1,
+          itemsPerBox: 10,
+          barcode: '',
+        },
       ]);
     }
     setSearchTerm('');
@@ -204,10 +210,20 @@ function CreatePlanModal({ isOpen, onClose }) {
   };
 
   const handleUpdateProduct = (id, field, value) => {
-    setSelectedProducts(
-      selectedProducts.map((p) =>
-        p.id === id ? { ...p, [field]: parseInt(value) || 0 } : p
-      )
+    setSelectedProducts((prev) =>
+      prev.map((p) => {
+        if (p.id !== id) return p;
+        if (field === 'boxCount' || field === 'itemsPerBox') {
+          const numericValue = Number(value);
+          const safeValue = Number.isFinite(numericValue)
+            ? Math.max(field === 'itemsPerBox' ? 1 : 0, Math.floor(numericValue))
+            : field === 'itemsPerBox'
+              ? 1
+              : 0;
+          return { ...p, [field]: safeValue };
+        }
+        return { ...p, [field]: value };
+      })
     );
   };
 
@@ -235,6 +251,8 @@ function CreatePlanModal({ isOpen, onClose }) {
     setSelectedProducts([]);
     setSelectedClusters([]);
     setCalculationResults([]);
+    setIsSaving(false);
+    setError(null);
     // 不清空所有产品数据，以便下次打开时可以快速显示
   }, [onClose]);
 
@@ -267,87 +285,216 @@ function CreatePlanModal({ isOpen, onClose }) {
   }, [isOpen, handleClose]);
 
   const handleSave = async () => {
+    if (isSaving || isCalculating) return;
     if (!planName.trim()) {
-      alert('请输入计划名称');
+      setError('请输入计划名称');
       return;
     }
     if (selectedClusters.length === 0) {
-      alert('请选择至少一个集群');
+      setError('请选择至少一个集群');
       return;
     }
     if (selectedProducts.length === 0) {
-      alert('请添加至少一个产品');
+      setError('请添加至少一个产品');
       return;
     }
-    
-    console.log('保存计划', { planName, selectedClusters, selectedProducts });
-    
+    if (!user) {
+      setError('请先登录后再创建发货计划');
+      return;
+    }
+
+    const normalizedPlanName = planName.trim();
     try {
+      setIsSaving(true);
       setIsCalculating(true);
-      
-      // 准备发送到Edge Function的数据
+      setError(null);
+
+      const { data: existingPlans, error: existingPlansError } = await supabase
+        .from('shipping_plans')
+        .select('id')
+        .eq('user_id', user.id)
+        .eq('name', normalizedPlanName);
+
+      if (existingPlansError) {
+        throw existingPlansError;
+      }
+
+      if (existingPlans && existingPlans.length > 0) {
+        setError('已存在同名发货计划，请修改名称后再试。');
+        setIsSaving(false);
+        setIsCalculating(false);
+        return;
+      }
+
       const requestData = {
-        products: selectedProducts.map(product => ({
+        products: selectedProducts.map((product) => ({
           id: product.id,
           sku: product.sku,
           ozonId: product.ozonId,
-          boxCount: product.boxCount || 1,      // 用户指定的总箱数
-          itemsPerBox: product.itemsPerBox || 1 // 每箱物品数量
+          boxCount: product.boxCount || 1,
+          itemsPerBox: product.itemsPerBox || 1,
         })),
-        clusters: selectedClusters.map(cluster => ({
+        clusters: selectedClusters.map((cluster) => ({
           id: cluster.id,
-          name: cluster.name || cluster.name_cn, // 确保名称不为空，便于历史匹配
+          name: cluster.name || cluster.name_cn,
           nameCn: cluster.name_cn || cluster.name,
-          safeDays: cluster.safe_days || 7
+          safeDays: cluster.safe_days || 7,
         })),
-        user_id: user.id
+        user_id: user.id,
       };
-      
-      console.log('发送到Edge Function的数据:', requestData);
-      
-      // 调用Edge Function计算发货计划
-      const { data, error } = await supabase.functions.invoke('shipping-calculator', {
-        body: requestData
-      });
-      
+
+      const { data: calcData, error: calcError } = await supabase.functions.invoke(
+        'shipping-calculator',
+        {
+          body: requestData,
+        }
+      );
+
       setIsCalculating(false);
-      
-      if (error) {
-        console.error('调用Edge Function失败:', error);
-        alert('计算发货计划失败: ' + error.message);
-        return;
+
+      if (calcError) {
+        console.error('调用Edge Function失败:', calcError);
+        throw new Error(calcError.message || '计算发货计划失败');
       }
-      
-      console.log('计算结果:', data);
-      
-      // 检查是否有计算结果
-      if (!data.success || !data.results || data.results.length === 0) {
-        alert('计算完成，但没有生成具体结果');
-        return;
+
+      if (calcData?.error) {
+        throw new Error(calcData.error);
       }
-      
-      // 导航到编辑页面，并传递计算结果
-      const tempPlanId = Date.now();
-      navigate(`/shipping-plans/${tempPlanId}/edit`, { 
-        state: { 
-          planName,
-          products: selectedProducts,
-          clusters: selectedClusters,
-          calculationResults: data.results
-        } 
+
+      const results = Array.isArray(calcData?.results) ? calcData.results : [];
+      setCalculationResults(results);
+
+      const totalBoxes = selectedProducts.reduce(
+        (sum, product) => sum + (product.boxCount || 0),
+        0
+      );
+      const totalSkus = selectedProducts.length;
+      const planStatus = results.length > 0 ? 'ready' : 'draft';
+
+      const { data: planRows, error: planError } = await supabase
+        .from('shipping_plans')
+        .insert([
+          {
+            name: normalizedPlanName,
+            user_id: user.id,
+            status: planStatus,
+            total_boxes: totalBoxes,
+            total_skus: totalSkus,
+          },
+        ])
+        .select('id, name');
+
+      if (planError) {
+        throw planError;
+      }
+
+      const planRecord = planRows?.[0];
+      if (!planRecord) {
+        throw new Error('未能创建发货计划，请稍后重试');
+      }
+
+      const planProductsPayload = selectedProducts.map((product) => ({
+        plan_id: planRecord.id,
+        sku: product.sku,
+        ozon_id: product.ozonId,
+        product_name: product.name || null,
+        box_count: product.boxCount || 0,
+        items_per_box: product.itemsPerBox || 1,
+        carton_barcode: product.barcode ? product.barcode.trim() : null,
+      }));
+
+      const { data: insertedPlanProducts, error: planProductsError } = await supabase
+        .from('plan_products')
+        .insert(planProductsPayload)
+        .select('id, sku, ozon_id');
+
+      if (planProductsError) {
+        throw planProductsError;
+      }
+
+      const planProductIdByOriginal = new Map();
+      insertedPlanProducts?.forEach((row) => {
+        const match = selectedProducts.find(
+          (product) => product.sku === row.sku && product.ozonId === row.ozon_id
+        );
+        if (match) {
+          planProductIdByOriginal.set(String(match.id), row.id);
+        }
       });
-      
-      // 重置表单
-      setPlanName('');
-      setSelectedProducts([]);
-      setSelectedClusters([]);
-      setCalculationResults([]);
-      
-      onClose();
+      selectedProducts.forEach((product, index) => {
+        const row = insertedPlanProducts?.[index];
+        if (row && !planProductIdByOriginal.has(String(product.id))) {
+          planProductIdByOriginal.set(String(product.id), row.id);
+        }
+      });
+
+      const planClustersPayload = selectedClusters.map((cluster) => ({
+        plan_id: planRecord.id,
+        cluster_id: cluster.id ?? null,
+        cluster_code: cluster.name || cluster.name_cn || null,
+        cluster_name: cluster.name_cn || cluster.name || '未命名集群',
+        shipping_point_id: null,
+        shipping_point: null,
+        pallets: 0,
+        pallet_allocations: null,
+      }));
+
+      const { data: insertedPlanClusters, error: planClustersError } = await supabase
+        .from('plan_clusters')
+        .insert(planClustersPayload)
+        .select('id, cluster_id');
+
+      if (planClustersError) {
+        throw planClustersError;
+      }
+
+      const planClusterIdByCluster = new Map();
+      insertedPlanClusters?.forEach((row, index) => {
+        if (row.cluster_id !== null && row.cluster_id !== undefined) {
+          planClusterIdByCluster.set(String(row.cluster_id), row.id);
+        }
+        const relatedCluster = selectedClusters[index];
+        if (relatedCluster && !planClusterIdByCluster.has(String(relatedCluster.id))) {
+          planClusterIdByCluster.set(String(relatedCluster.id), row.id);
+        }
+      });
+
+      const allocationPayload = [];
+      if (results.length > 0) {
+        results.forEach((result) => {
+          const planProductId = planProductIdByOriginal.get(String(result.product_id));
+          const planClusterId = planClusterIdByCluster.get(String(result.cluster_id));
+          if (!planProductId || !planClusterId) return;
+
+          const boxes = Math.max(0, Math.round(result.recommended_boxes || 0));
+          allocationPayload.push({
+            plan_id: planRecord.id,
+            cluster_id: planClusterId,
+            product_id: planProductId,
+            boxes,
+          });
+        });
+      }
+
+      if (allocationPayload.length > 0) {
+        const { error: allocationError } = await supabase
+          .from('plan_allocations')
+          .insert(allocationPayload);
+
+        if (allocationError) {
+          throw allocationError;
+        }
+      }
+
+      onPlanCreated();
+      handleClose();
+      navigate(`/shipping-plans/${planRecord.id}/edit`);
     } catch (err) {
-      setIsCalculating(false);
       console.error('保存计划时出错:', err);
-      alert('保存计划时出错: ' + err.message);
+      setError(err.message || '保存计划时出错，请稍后重试');
+    } finally {
+      setIsSaving(false);
+      setIsCalculating(false);
     }
   };
 
@@ -363,7 +510,7 @@ function CreatePlanModal({ isOpen, onClose }) {
         <div className="flex items-center justify-between border-b border-gray-200 p-6">
           <h3 className="text-lg font-semibold text-gray-900">创建发货计划</h3>
           <button
-            onClick={onClose}
+            onClick={handleClose}
             className="btn btn-ghost p-0 h-6 w-6 text-gray-500 hover:text-gray-700"
             aria-label="关闭"
           >
@@ -375,6 +522,11 @@ function CreatePlanModal({ isOpen, onClose }) {
 
         {/* 弹窗内容 */}
         <div className="flex-1 overflow-y-auto p-6 space-y-6">
+          {error && (
+            <div className="alert alert-destructive">
+              <div className="alert-description">{error}</div>
+            </div>
+          )}
           {/* 计划名称输入 */}
           <div className="space-y-2">
             <label htmlFor="planName" className="block text-sm font-medium text-gray-700">
@@ -615,18 +767,18 @@ function CreatePlanModal({ isOpen, onClose }) {
         {/* 弹窗底部 */}
         <div className="flex items-center justify-end gap-3 border-t border-gray-200 p-6">
           <button
-            onClick={onClose}
+            onClick={handleClose}
             className="btn btn-outline"
-            disabled={isCalculating}
+            disabled={isSaving || isCalculating}
           >
             取消
           </button>
           <button
             onClick={handleSave}
             className="btn btn-default"
-            disabled={isCalculating}
+            disabled={isSaving || isCalculating}
           >
-            {isCalculating ? '计算中...' : '保存计划'}
+            {isSaving ? '保存中...' : isCalculating ? '计算中...' : '保存计划'}
           </button>
         </div>
         

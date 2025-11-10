@@ -1,5 +1,5 @@
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import { supabase } from '../supabaseClient';
 
@@ -8,27 +8,26 @@ function EditPlan() {
   const location = useLocation();
   const navigate = useNavigate();
   const { user } = useAuth();
-  
-  // 从location.state获取传递的数据
-  const { planName: initialPlanName, products: initialProducts, clusters: initialClusters, calculationResults } = location.state || {};
+  const { calculationResults: initialCalculationResults } = location.state || {};
 
-  const [planName, setPlanName] = useState(initialPlanName || '2024年1月发货计划');
-  const [products, setProducts] = useState(initialProducts || [
-    {
-      id: 1,
-      sku: 'SKU-001',
-      ozonId: 'OZ123456',
-      boxCount: 10,
-      itemsPerBox: 20,
-    },
-    {
-      id: 2,
-      sku: 'SKU-002',
-      ozonId: 'OZ123457',
-      boxCount: 5,
-      itemsPerBox: 15,
-    },
-  ]);
+  const [planName, setPlanName] = useState('');
+  const [planStatus, setPlanStatus] = useState('draft');
+  const [products, setProducts] = useState([]);
+  const [clusterAllocations, setClusterAllocations] = useState([]);
+  const [calculationResults, setCalculationResults] = useState(initialCalculationResults || []);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState(null);
+  const [removedProductIds, setRemovedProductIds] = useState([]);
+  const [removedClusterIds, setRemovedClusterIds] = useState([]);
+  const [clusterExecutionState, setClusterExecutionState] = useState({});
+  const pdfObjectUrlsRef = useRef([]);
+
+  useEffect(() => {
+    if (initialCalculationResults && initialCalculationResults.length > 0) {
+      setCalculationResults(initialCalculationResults);
+    }
+  }, [initialCalculationResults]);
 
   // 发货点数据（来自 ShippingPointSettings 保存的 shipping_points 表）
   const [shippingPoints, setShippingPoints] = useState([]);
@@ -52,93 +51,100 @@ function EditPlan() {
     fetchShippingPoints();
   }, []);
 
-  // 根据计算结果初始化集群分配数据
-  const initializeClusterAllocations = () => {
-    if (calculationResults && calculationResults.length > 0) {
-      // 根据计算结果创建集群分配数据
-      const clusterMap = new Map();
-      
-      calculationResults.forEach(result => {
-        if (!clusterMap.has(result.cluster_id)) {
-          clusterMap.set(result.cluster_id, {
-            id: result.cluster_id,
-            clusterName: result.cluster_name,
-            shippingPoint: '',
-            productRecommendations: [],
-            allocations: [],
-            pallets: 0,
-            palletAllocations: {}
-          });
-        }
-        
-        const cluster = clusterMap.get(result.cluster_id);
-        cluster.productRecommendations.push({
-          productId: result.product_id,
-          recommendedBoxes: result.recommended_boxes
-        });
-        
-        cluster.allocations.push({
-          productId: result.product_id,
-          boxes: result.recommended_boxes
-        });
-      });
-      
-      return Array.from(clusterMap.values());
-    } else if (initialClusters && initialClusters.length > 0) {
-      // 如果没有计算结果但有初始集群数据
-      return initialClusters.map(cluster => ({
-        id: cluster.id,
-        clusterName: cluster.nameCn || cluster.name,
-        shippingPoint: '',
-        productRecommendations: [],
-        allocations: [],
-        pallets: 0,
-        palletAllocations: {}
-      }));
-    } else {
-      // 默认集群数据
-      return [
-        {
-          id: 1,
-          clusterName: '莫斯科集群',
-          shippingPoint: '',
-          productRecommendations: [
-            { productId: 1, recommendedBoxes: 3 },
-            { productId: 2, recommendedBoxes: 2 }
-          ],
-          allocations: [
-            { productId: 1, boxes: 3 },
-            { productId: 2, boxes: 2 }
-          ],
-          pallets: 2,
-          palletAllocations: {
-            0: { 1: 2, 2: 1 },
-            1: { 1: 1, 2: 1 }
-          }
-        },
-        {
-          id: 2,
-          clusterName: '圣彼得堡集群',
-          shippingPoint: '',
-          productRecommendations: [
-            { productId: 1, recommendedBoxes: 2 },
-            { productId: 2, recommendedBoxes: 1 }
-          ],
-          allocations: [
-            { productId: 1, boxes: 2 },
-            { productId: 2, boxes: 1 }
-          ],
-          pallets: 1,
-          palletAllocations: {
-            0: { 1: 2, 2: 1 }
-          }
-        },
-      ];
-    }
-  };
+  const fetchPlan = useCallback(async () => {
+    if (!id || !user) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const { data: planData, error: planError } = await supabase
+        .from('shipping_plans')
+        .select('*')
+        .eq('id', id)
+        .eq('user_id', user.id)
+        .single();
 
-  // 集群分配数据，包含每个产品在各集群的分配情况
-  const [clusterAllocations, setClusterAllocations] = useState(initializeClusterAllocations());
+      if (planError) throw planError;
+      if (!planData) throw new Error('未找到发货计划');
+
+      const [
+        { data: planProductsData, error: planProductsError },
+        { data: planClustersData, error: planClustersError },
+        { data: planAllocationsData, error: planAllocationsError },
+      ] = await Promise.all([
+        supabase
+          .from('plan_products')
+          .select('id, sku, ozon_id, product_name, box_count, items_per_box, carton_barcode')
+          .eq('plan_id', id)
+          .order('created_at', { ascending: true }),
+        supabase
+          .from('plan_clusters')
+          .select('id, cluster_id, cluster_code, cluster_name, shipping_point_id, shipping_point, pallets, pallet_allocations')
+          .eq('plan_id', id)
+          .order('created_at', { ascending: true }),
+        supabase
+          .from('plan_allocations')
+          .select('id, plan_id, cluster_id, product_id, boxes')
+          .eq('plan_id', id),
+      ]);
+
+      if (planProductsError) throw planProductsError;
+      if (planClustersError) throw planClustersError;
+      if (planAllocationsError) throw planAllocationsError;
+
+      setPlanName(planData.name || '');
+      setPlanStatus(planData.status || 'draft');
+
+      const productList = (planProductsData || []).map((row) => ({
+        id: row.id,
+        sku: row.sku,
+        ozonId: row.ozon_id,
+        productName: row.product_name,
+        boxCount: row.box_count || 0,
+        itemsPerBox: row.items_per_box || 1,
+        barcode: row.carton_barcode || '',
+      }));
+
+      const allocationsByCluster = new Map();
+      (planAllocationsData || []).forEach((row) => {
+        if (!row.cluster_id) return;
+        const list = allocationsByCluster.get(row.cluster_id) || [];
+        list.push({
+          id: row.id,
+          productId: row.product_id,
+          boxes: row.boxes || 0,
+        });
+        allocationsByCluster.set(row.cluster_id, list);
+      });
+
+      const clusterList = (planClustersData || []).map((row) => ({
+        id: row.id,
+        clusterId: row.cluster_id,
+        clusterCode: row.cluster_code,
+        clusterName: row.cluster_name,
+        shippingPointId: row.shipping_point_id,
+        shippingPoint: row.shipping_point || '',
+        productRecommendations: [],
+        allocations: allocationsByCluster.get(row.id) || [],
+        pallets: row.pallets || 0,
+        palletAllocations: row.pallet_allocations || {},
+      }));
+
+      setProducts(productList);
+      setClusterAllocations(clusterList);
+      setRemovedProductIds([]);
+      setRemovedClusterIds([]);
+      setClusterExecutionState({});
+    } catch (err) {
+      console.error('加载计划数据失败:', err);
+      setError(err.message || '加载计划数据失败');
+    } finally {
+      setLoading(false);
+    }
+  }, [id, user]);
+
+  useEffect(() => {
+    fetchPlan();
+  }, [fetchPlan]);
 
   // 弹窗状态
   const [isBoxModalOpen, setIsBoxModalOpen] = useState(false);
@@ -167,33 +173,78 @@ function EditPlan() {
     };
   }, [isBoxModalOpen, isPalletModalOpen]);
 
+  useEffect(() => {
+    return () => {
+      pdfObjectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+    };
+  }, []);
+
+  const isUuid = (value) => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+
+  const createPdfObjectUrl = (base64) => {
+    if (!base64) return null;
+    const pureBase64 = base64.includes(',') ? base64.split(',').pop() : base64;
+    try {
+      const byteCharacters = atob(pureBase64);
+      const byteNumbers = Array.from(byteCharacters).map((char) => char.charCodeAt(0));
+      const byteArray = new Uint8Array(byteNumbers);
+      const blob = new Blob([byteArray], { type: 'application/pdf' });
+      const objectUrl = URL.createObjectURL(blob);
+      pdfObjectUrlsRef.current.push(objectUrl);
+      return objectUrl;
+    } catch {
+      return null;
+    }
+  };
+
   const handleUpdateProduct = (productId, field, value) => {
-    setProducts(
-      products.map((p) =>
-        p.id === productId
-          ? {
-              ...p,
-              [field]: field === 'boxCount' || field === 'itemsPerBox'
-                ? (parseInt(value) || 0)
-                : value,
-            }
-          : p
-      )
+    setProducts((prev) =>
+      prev.map((p) => {
+        if (p.id !== productId) return p;
+        if (field === 'boxCount' || field === 'itemsPerBox') {
+          const numericValue = Number(value);
+          const safeValue = Number.isFinite(numericValue)
+            ? Math.max(field === 'itemsPerBox' ? 1 : 0, Math.floor(numericValue))
+            : field === 'itemsPerBox'
+              ? 1
+              : 0;
+          return { ...p, [field]: safeValue };
+        }
+        return { ...p, [field]: value };
+      })
     );
   };
 
   const handleRemoveProduct = (productId) => {
-    setProducts(products.filter((p) => p.id !== productId));
-    // 同时移除该产品在所有集群中的分配记录
-    setClusterAllocations(clusterAllocations.map(cluster => ({
-      ...cluster,
-      allocations: cluster.allocations.filter(alloc => alloc.productId !== productId)
-    })));
+    const targetProduct = products.find((p) => p.id === productId);
+    if (targetProduct && isUuid(targetProduct.id)) {
+      setRemovedProductIds((prev) =>
+        prev.includes(targetProduct.id) ? prev : [...prev, targetProduct.id]
+      );
+    }
+    setProducts((prev) => prev.filter((p) => p.id !== productId));
+    setClusterAllocations((prev) =>
+      prev.map((cluster) => ({
+        ...cluster,
+        allocations: cluster.allocations.filter((alloc) => alloc.productId !== productId),
+      }))
+    );
   };
 
-  // 删除集群分配
   const handleRemoveCluster = (clusterId) => {
-    setClusterAllocations(clusterAllocations.filter((c) => c.id !== clusterId));
+    const targetCluster = clusterAllocations.find((c) => c.id === clusterId);
+    if (targetCluster && isUuid(targetCluster.id)) {
+      setRemovedClusterIds((prev) =>
+        prev.includes(targetCluster.id) ? prev : [...prev, targetCluster.id]
+      );
+    }
+    setClusterAllocations((prev) => prev.filter((c) => c.id !== clusterId));
+    setClusterExecutionState((prev) => {
+      if (!prev[clusterId]) return prev;
+      const next = { ...prev };
+      delete next[clusterId];
+      return next;
+    });
   };
 
   // 获取指定产品在指定集群的分配箱数
@@ -241,14 +292,80 @@ function EditPlan() {
   };
 
   // 更新集群的发货点
-  const updateShippingPoint = (clusterId, shippingPoint) => {
-    setClusterAllocations(prev => 
-      prev.map(cluster => 
-        cluster.id === clusterId 
-          ? { ...cluster, shippingPoint } 
+  const updateShippingPoint = (clusterId, shippingPointValue) => {
+    const point = shippingPoints.find((p) => p.point_id === shippingPointValue);
+    setClusterAllocations((prev) =>
+      prev.map((cluster) =>
+        cluster.id === clusterId
+          ? {
+              ...cluster,
+              shippingPoint: shippingPointValue,
+              shippingPointId: point ? point.id : null,
+            }
           : cluster
       )
     );
+  };
+
+  const updateClusterExecution = (clusterId, nextState) => {
+    setClusterExecutionState((prev) => ({
+      ...prev,
+      [clusterId]: {
+        ...(prev[clusterId] || {}),
+        ...nextState,
+      },
+    }));
+  };
+
+  const handleExecuteCluster = async (cluster) => {
+    if (!user) {
+      setError('请先登录后再执行发货任务');
+      return;
+    }
+    if (!isUuid(cluster.id)) {
+      updateClusterExecution(cluster.id, {
+        status: 'error',
+        error: '请先保存计划后再执行该集群',
+      });
+      return;
+    }
+
+    updateClusterExecution(cluster.id, { status: 'loading', error: null });
+    try {
+      const { data, error: functionError } = await supabase.functions.invoke('execute-plan', {
+        body: {
+          plan_id: id,
+          plan_cluster_id: cluster.id,
+          cluster_id: cluster.clusterId || cluster.id,
+          user_id: user.id,
+        },
+      });
+
+      if (functionError) {
+        throw new Error(functionError.message || '执行失败');
+      }
+      if (!data?.success) {
+        throw new Error(data?.message || '执行失败');
+      }
+
+      let pdfUrl = data.pdfUrl || data.pdf_url;
+      if (!pdfUrl && data.pdf_base64) {
+        pdfUrl = createPdfObjectUrl(data.pdf_base64);
+      }
+
+      updateClusterExecution(cluster.id, {
+        status: 'success',
+        pdfUrl: pdfUrl || null,
+        message: data?.message || '执行完成',
+        completedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      console.error('执行集群失败:', err);
+      updateClusterExecution(cluster.id, {
+        status: 'error',
+        error: err.message || '执行失败，请稍后重试',
+      });
+    }
   };
 
   // 计算集群的总箱数（包括纸箱和托盘中的箱数）
@@ -284,11 +401,11 @@ function EditPlan() {
     // 计算托盘中的物品数量
     let palletItems = 0;
     if (cluster.palletAllocations) {
-      Object.values(cluster.palletAllocations).forEach(pallet => {
+      Object.values(cluster.palletAllocations).forEach((pallet) => {
         Object.entries(pallet).forEach(([productId, boxes]) => {
-          const product = products.find(p => p.id === parseInt(productId));
+          const product = products.find((p) => String(p.id) === String(productId));
           if (product) {
-            palletItems += boxes * product.itemsPerBox;
+            palletItems += (boxes || 0) * product.itemsPerBox;
           }
         });
       });
@@ -324,112 +441,150 @@ function EditPlan() {
   };
 
   const handleSave = async () => {
-    console.log('保存计划', { planName, products, clusterAllocations });
-    // 校验：箱条码为必填
-    const missingBarcode = products.find(p => !p.barcode || String(p.barcode).trim() === '');
-    if (missingBarcode) {
-      alert(`请为所有产品填写箱条码（缺少: ${missingBarcode.sku}）`);
+    if (saving || loading) return;
+    if (!user) {
+      setError('请先登录后再保存发货计划');
       return;
     }
-    
+    if (!planName.trim()) {
+      setError('请输入计划名称');
+      return;
+    }
+    const missingBarcode = products.find(
+      (p) => !p.barcode || String(p.barcode).trim() === ''
+    );
+    if (missingBarcode) {
+      setError(`请为产品 ${missingBarcode.sku} 填写箱条码`);
+      return;
+    }
+
     try {
-      // 保存计划信息到数据库
-      const { data: planData, error: planError } = await supabase
+      setSaving(true);
+      setError(null);
+
+      const totalBoxes = products.reduce(
+        (sum, product) => sum + (product.boxCount || 0),
+        0
+      );
+      const totalSkus = products.length;
+
+      const { error: updatePlanError } = await supabase
         .from('shipping_plans')
-        .insert([
-          {
-            name: planName,
-            user_id: user.id,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString()
-          }
-        ])
-        .select()
-        .single();
+        .update({
+          name: planName.trim(),
+          total_boxes: totalBoxes,
+          total_skus: totalSkus,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', id)
+        .eq('user_id', user.id);
 
-      if (planError) {
-        console.error('保存计划信息失败:', planError);
-        alert('保存计划信息失败: ' + planError.message);
-        return;
+      if (updatePlanError) throw updatePlanError;
+
+      const productPayload = products.map((product) => {
+        const payload = {
+          plan_id: id,
+          sku: product.sku,
+          ozon_id: product.ozonId,
+          product_name: product.productName ?? null,
+          box_count: product.boxCount || 0,
+          items_per_box: product.itemsPerBox || 1,
+          carton_barcode: product.barcode ? product.barcode.trim() : null,
+        };
+        if (isUuid(product.id)) {
+          payload.id = product.id;
+        }
+        return payload;
+      });
+
+      if (productPayload.length > 0) {
+        const { error: upsertProductsError } = await supabase
+          .from('plan_products')
+          .upsert(productPayload, { onConflict: 'id' });
+        if (upsertProductsError) throw upsertProductsError;
       }
 
-      const planId = planData.id;
-      
-      // 保存产品信息到数据库
-      const productInserts = products.map(product => ({
-        plan_id: planId,
-        sku: product.sku,
-        ozon_id: product.ozonId,
-        box_count: product.boxCount,
-        items_per_box: product.itemsPerBox,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      }));
-      
-      const { error: productError } = await supabase
-        .from('plan_products')
-        .insert(productInserts);
-
-      if (productError) {
-        console.error('保存产品信息失败:', productError);
-        alert('保存产品信息失败: ' + productError.message);
-        return;
+      if (removedProductIds.length > 0) {
+        const { error: deleteProductsError } = await supabase
+          .from('plan_products')
+          .delete()
+          .in('id', removedProductIds);
+        if (deleteProductsError) throw deleteProductsError;
+        setRemovedProductIds([]);
       }
-      
-      // 保存集群分配信息到数据库
-      const clusterInserts = clusterAllocations.map(cluster => ({
-        plan_id: planId,
-        cluster_id: cluster.id,
-        cluster_name: cluster.clusterName,
-        shipping_point: cluster.shippingPoint,
-        pallets: cluster.pallets,
-        pallet_allocations: cluster.palletAllocations,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      }));
-      
-      const { error: clusterError } = await supabase
-        .from('plan_clusters')
-        .insert(clusterInserts);
 
-      if (clusterError) {
-        console.error('保存集群信息失败:', clusterError);
-        alert('保存集群信息失败: ' + clusterError.message);
-        return;
+      const clusterPayload = clusterAllocations.map((cluster) => {
+        const payload = {
+          plan_id: id,
+          cluster_id: cluster.clusterId ?? null,
+          cluster_code: cluster.clusterCode ?? null,
+          cluster_name: cluster.clusterName || '未命名集群',
+          shipping_point_id: cluster.shippingPointId ?? null,
+          shipping_point: cluster.shippingPoint || null,
+          pallets: cluster.pallets || 0,
+          pallet_allocations: cluster.palletAllocations || null,
+        };
+        if (isUuid(cluster.id)) {
+          payload.id = cluster.id;
+        }
+        return payload;
+      });
+
+      if (clusterPayload.length > 0) {
+        const { error: upsertClustersError } = await supabase
+          .from('plan_clusters')
+          .upsert(clusterPayload, { onConflict: 'id' });
+        if (upsertClustersError) throw upsertClustersError;
       }
-      
-      // 保存产品分配信息到数据库
-      const allocationInserts = [];
-      clusterAllocations.forEach(cluster => {
-        cluster.allocations.forEach(allocation => {
-          allocationInserts.push({
-            plan_id: planId,
-            cluster_id: cluster.id,
-            product_id: allocation.productId,
-            boxes: allocation.boxes,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString()
+
+      if (removedClusterIds.length > 0) {
+        const { error: deleteClustersError } = await supabase
+          .from('plan_clusters')
+          .delete()
+          .in('id', removedClusterIds);
+        if (deleteClustersError) throw deleteClustersError;
+        setRemovedClusterIds([]);
+      }
+
+      const allocationPayload = [];
+      clusterAllocations.forEach((cluster) => {
+        const clusterPlanId = isUuid(cluster.id) ? cluster.id : null;
+        if (!clusterPlanId) return;
+        cluster.allocations.forEach((allocation) => {
+          const productPlanId = isUuid(allocation.productId)
+            ? allocation.productId
+            : allocation.productId;
+          if (!productPlanId) return;
+          const boxes = Math.max(0, Math.floor(allocation.boxes || 0));
+          allocationPayload.push({
+            plan_id: id,
+            cluster_id: clusterPlanId,
+            product_id: productPlanId,
+            boxes,
           });
         });
       });
-      
-      if (allocationInserts.length > 0) {
-        const { error: allocationError } = await supabase
-          .from('plan_allocations')
-          .insert(allocationInserts);
 
-        if (allocationError) {
-          console.error('保存分配信息失败:', allocationError);
-          alert('保存分配信息失败: ' + allocationError.message);
-          return;
-        }
+      const { error: deleteAllocationsError } = await supabase
+        .from('plan_allocations')
+        .delete()
+        .eq('plan_id', id);
+      if (deleteAllocationsError) throw deleteAllocationsError;
+
+      if (allocationPayload.length > 0) {
+        const { error: insertAllocationsError } = await supabase
+          .from('plan_allocations')
+          .insert(allocationPayload);
+        if (insertAllocationsError) throw insertAllocationsError;
       }
-      
+
+      await fetchPlan();
       alert('计划保存成功！');
-      navigate('/shipping-plans');
     } catch (err) {
       console.error('保存计划时出错:', err);
-      alert('保存计划时出错: ' + err.message);
+      setError(err.message || '保存计划时出错，请稍后重试');
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -454,22 +609,21 @@ function EditPlan() {
 
     const handleSave = () => {
       if (currentClusterId) {
-        // 保存所有产品的箱数分配
-        Object.keys(boxAllocations).forEach(productId => {
-          updateBoxAllocation(
-            parseInt(productId), 
-            currentClusterId, 
-            boxAllocations[productId] || 0
-          );
+        Object.entries(boxAllocations).forEach(([productId, value]) => {
+          const boxes = Math.max(0, Math.floor(Number(value) || 0));
+          updateBoxAllocation(productId, currentClusterId, boxes);
         });
       }
       setIsBoxModalOpen(false);
     };
 
     const handleBoxChange = (productId, value) => {
-      setBoxAllocations(prev => ({
+      const numericValue = Number(value);
+      setBoxAllocations((prev) => ({
         ...prev,
-        [productId]: parseInt(value) || 0
+        [productId]: Number.isFinite(numericValue)
+          ? Math.max(0, Math.floor(numericValue))
+          : 0,
       }));
     };
 
@@ -552,7 +706,6 @@ function EditPlan() {
   const PalletModal = () => {
     const currentCluster = clusterAllocations.find(c => c.id === currentClusterId);
     const [pallets, setPallets] = useState(currentCluster?.pallets || 0);
-    const [boxesPerPallet, setBoxesPerPallet] = useState(currentCluster?.boxesPerPallet || 10);
     
     // 为每个托盘维护产品箱数分配
     const [palletAllocations, setPalletAllocations] = useState({});
@@ -580,17 +733,6 @@ function EditPlan() {
         updatePalletInfo(currentClusterId, pallets, palletAllocations);
       }
       setIsPalletModalOpen(false);
-    };
-
-    // 更新托盘信息（包括托盘分配）
-    const updatePalletInfo = (clusterId, pallets, allocations) => {
-      setClusterAllocations(prev => 
-        prev.map(cluster => 
-          cluster.id === clusterId 
-            ? { ...cluster, pallets, palletAllocations: allocations } 
-            : cluster
-        )
-      );
     };
 
     // 添加托盘
@@ -623,8 +765,8 @@ function EditPlan() {
         
         // 重新索引剩余托盘
         const reindexed = {};
-        Object.keys(newAllocations).forEach(key => {
-          const index = parseInt(key);
+        Object.keys(newAllocations).forEach((key) => {
+          const index = Number(key);
           if (index > palletIndex) {
             reindexed[index - 1] = newAllocations[key];
           } else if (index < palletIndex) {
@@ -638,12 +780,15 @@ function EditPlan() {
 
     // 更新托盘中产品的箱数
     const updatePalletBoxAllocation = (palletIndex, productId, boxes) => {
-      setPalletAllocations(prev => {
+      setPalletAllocations((prev) => {
         const newAllocations = { ...prev };
         if (!newAllocations[palletIndex]) {
           newAllocations[palletIndex] = {};
         }
-        newAllocations[palletIndex][productId] = parseInt(boxes) || 0;
+        const numericBoxes = Number(boxes);
+        newAllocations[palletIndex][productId] = Number.isFinite(numericBoxes)
+          ? Math.max(0, Math.floor(numericBoxes))
+          : 0;
         return newAllocations;
       });
     };
@@ -903,33 +1048,73 @@ function EditPlan() {
                   ))}
                 </select>
               </div>
-              <div className="flex items-center gap-4">
-                <button
-                  onClick={() => openBoxModal(cluster.id)}
-                  className="btn btn-outline"
-                >
-                  编辑箱数
-                </button>
-                <button
-                  onClick={() => openPalletModal(cluster.id)}
-                  className="btn btn-outline"
-                >
-                  编辑托盘
-                </button>
-              </div>
-              <div className="text-sm text-gray-500">
-                总箱数: {getTotalBoxesForCluster(cluster.id)}
-              </div>
-              <div className="text-sm text-gray-500">
-                总数量: {getTotalItemsForCluster(cluster.id)}
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => handleRemoveCluster(cluster.id)}
-                  className="btn btn-destructive"
-                >
-                  删除
-                </button>
+              <div className="flex flex-col items-end gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    onClick={() => openBoxModal(cluster.id)}
+                    className="btn btn-outline"
+                  >
+                    编辑箱数
+                  </button>
+                  <button
+                    onClick={() => openPalletModal(cluster.id)}
+                    className="btn btn-outline"
+                  >
+                    编辑托盘
+                  </button>
+                  <button
+                    onClick={() => handleExecuteCluster(cluster)}
+                    className="btn btn-default"
+                    disabled={
+                      clusterExecutionState[cluster.id]?.status === 'loading' ||
+                      !isUuid(cluster.id)
+                    }
+                    title={
+                      isUuid(cluster.id)
+                        ? ''
+                        : '请先保存计划以生成集群记录后再执行'
+                    }
+                  >
+                    {clusterExecutionState[cluster.id]?.status === 'loading'
+                      ? '执行中...'
+                      : '执行'}
+                  </button>
+                  <button
+                    onClick={() => handleRemoveCluster(cluster.id)}
+                    className="btn btn-destructive"
+                  >
+                    删除
+                  </button>
+                </div>
+                <div className="flex flex-col items-end text-sm text-gray-500">
+                  <span>总箱数: {getTotalBoxesForCluster(cluster.id)}</span>
+                  <span>总数量: {getTotalItemsForCluster(cluster.id)}</span>
+                </div>
+                {clusterExecutionState[cluster.id]?.status === 'success' && (
+                  <div className="text-xs text-green-600 text-right">
+                    完成
+                    {clusterExecutionState[cluster.id]?.completedAt &&
+                      ` · ${new Date(
+                        clusterExecutionState[cluster.id].completedAt
+                      ).toLocaleString()}`}
+                    {clusterExecutionState[cluster.id]?.pdfUrl && (
+                      <a
+                        href={clusterExecutionState[cluster.id].pdfUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        download={`${planName || 'plan'}-${cluster.clusterName}.pdf`}
+                        className="ml-2 underline text-blue-600"
+                      >
+                        下载PDF
+                      </a>
+                    )}
+                  </div>
+                )}
+                {clusterExecutionState[cluster.id]?.status === 'error' && (
+                  <div className="text-xs text-red-600 text-right">
+                    {clusterExecutionState[cluster.id].error}
+                  </div>
+                )}
               </div>
             </div>
           ))}
